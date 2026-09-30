@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ko" xmlns:th="http://www.thymeleaf.org" th:fragment="page(title, content)">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title th:text="${title} + ' · Planify'">Planify</title>
+  <link href="https://cdn.jsdelivr.net/npm/startbootstrap-sb-admin-2@4.1.4/css/sb-admin-2.min.css" rel="stylesheet">
+  <link th:href="@{/css/planify.css}" rel="stylesheet">
+</head>
+<body id="page-top"><div id="wrapper">
+  <ul class="navbar-nav bg-gradient-primary sidebar sidebar-dark accordion" id="accordionSidebar">
+    <a class="sidebar-brand d-flex align-items-center justify-content-center" th:href="@{/}"><span class="sidebar-brand-text">Planify<span class="brand-dot">.</span></span></a>
+    <hr class="sidebar-divider my-0">
+    <li class="sidebar-heading mt-4" th:text="${me.role.name() == 'INSTRUCTOR' ? '강사 공간' : '학생 공간'}"></li>
+    <th:block th:if="${me.role.name() == 'INSTRUCTOR'}">
+      <li class="nav-item"><a class="nav-link" th:href="@{/instructor/dashboard}">통계 대시보드</a></li>
+      <li class="nav-item"><a class="nav-link" th:href="@{/instructor/courses}">강좌 · 수강생 · 과제 관리</a></li>
+    </th:block>
+    <th:block th:if="${me.role.name() == 'STUDENT'}">
+      <li class="nav-item"><a class="nav-link" th:href="@{/student/dashboard}">내 통계</a></li>
+      <li class="nav-item"><a class="nav-link" th:href="@{/student/courses}">수강 등록 · 내 강좌</a></li>
+      <li class="nav-item"><a class="nav-link" th:href="@{/student/assignments}">내 과제 · 결과 확인</a></li>
+    </th:block>
+    <hr class="sidebar-divider"><li class="px-3 text-white-50 small">오늘의 계획을<br>완성으로 연결하세요.</li>
+  </ul>
+  <div id="content-wrapper" class="d-flex flex-column"><div id="content">
+    <nav class="navbar navbar-expand navbar-light bg-white topbar mb-4 shadow-sm justify-content-between">
+      <button id="sidebarToggleTop" class="btn btn-link d-md-none" type="button" aria-label="메뉴 접기">☰</button>
+      <span class="small text-muted">프로젝트 제출 관리</span><div class="d-flex align-items-center"><span class="mr-3" th:text="${me.name}"></span><form th:action="@{/logout}" method="post"><button class="btn btn-sm btn-outline-secondary">로그아웃</button></form></div>
+    </nav>
+    <main class="container-fluid pb-5"><div class="alert alert-success" role="status" th:if="${success}" th:text="${success}"></div><th:block th:replace="${content}"></th:block></main>
+  </div><footer class="sticky-footer bg-white"><div class="container text-center small">Planify · 모든 일시는 한국 시간 (Asia/Seoul) 기준입니다.</div></footer></div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/startbootstrap-sb-admin-2@4.1.4/js/sb-admin-2.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js"></script>
+<script th:src="@{/js/planify.js}"></script>
+</body></html>
