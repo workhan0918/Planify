@@ -64,11 +64,78 @@ public class PlanifyService {
         String code; do { code = UUID.randomUUID().toString().replace("-", "").substring(0, 10).toUpperCase(Locale.ROOT); } while (courses.existsByCode(code));
         c.setCode(code); return courses.save(c);
     }
+    @Transactional public String refreshCourseCode(Long courseId, Account a) {
+        role(a, Account.Role.INSTRUCTOR);
+        Course c = course(courseId, a);
+        String code;
+        do { code = UUID.randomUUID().toString().replace("-", "").substring(0, 10).toUpperCase(Locale.ROOT); }
+        while (courses.existsByCode(code));
+        c.setCode(code);
+        return code;
+    }
     @Transactional public void enroll(String code, Account a) {
         role(a, Account.Role.STUDENT);
         Course c = courses.findByCode(code.trim().toUpperCase(Locale.ROOT)).orElseThrow(() -> new RuleException("참여코드를 확인해주세요."));
         if (enrollments.existsByCourseIdAndStudentId(c.getId(), a.getId())) throw new RuleException("이미 등록된 강좌입니다.");
         Enrollment e = new Enrollment(); e.setCourse(c); e.setStudent(a); enrollments.save(e);
+    }
+    public record EnrollmentImportResult(int enrolled, int alreadyEnrolled) {}
+    @Transactional public EnrollmentImportResult importEnrollmentCsv(Long courseId, MultipartFile upload, Account a) {
+        role(a, Account.Role.INSTRUCTOR); Course target = course(courseId, a);
+        if (upload == null || upload.isEmpty()) throw new RuleException("수강생 CSV 파일을 선택해주세요.");
+        if (upload.getSize() > 5L * 1024 * 1024) throw new RuleException("CSV 파일은 최대 5MB까지 허용됩니다.");
+        String csv;
+        try { csv = new String(upload.getBytes(), java.nio.charset.StandardCharsets.UTF_8).replaceFirst("^\\uFEFF", ""); }
+        catch (java.io.IOException ex) { throw new RuleException("CSV 파일을 읽을 수 없습니다."); }
+        List<List<String>> rows = parseCsv(csv);
+        if (rows.isEmpty()) throw new RuleException("CSV에 헤더와 학번을 입력해주세요.");
+        int numberColumn = -1;
+        for (int i = 0; i < rows.get(0).size(); i++) {
+            String header = rows.get(0).get(i).trim();
+            if (header.equals("학번") || header.equalsIgnoreCase("studentNumber")) { numberColumn = i; break; }
+        }
+        if (numberColumn < 0) throw new RuleException("CSV 첫 행에 '학번' 열이 필요합니다. 강좌 성적표 CSV도 사용할 수 있습니다.");
+        LinkedHashMap<String, Account> studentsByNumber = new LinkedHashMap<>();
+        List<String> unknown = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (int i = 1; i < rows.size(); i++) {
+            List<String> row = rows.get(i);
+            String number = numberColumn < row.size() ? row.get(numberColumn).trim() : "";
+            if (number.isEmpty() || !seen.add(number)) continue;
+            if (seen.size() > 1000) throw new RuleException("한 번에 최대 1,000명까지 등록할 수 있습니다.");
+            Account student = accounts.findByStudentNumber(number).filter(x -> x.getRole() == Account.Role.STUDENT).orElse(null);
+            if (student == null) { if (unknown.size() < 10) unknown.add(number + " (" + (i + 1) + "행)"); }
+            else studentsByNumber.put(number, student);
+        }
+        if (!unknown.isEmpty()) throw new RuleException("등록되지 않은 학생 학번이 있습니다. 먼저 학생 계정을 생성해주세요: " + String.join(", ", unknown));
+        int added = 0, existing = 0;
+        for (Account student : studentsByNumber.values()) {
+            if (enrollments.existsByCourseIdAndStudentId(target.getId(), student.getId())) { existing++; continue; }
+            Enrollment enrollment = new Enrollment(); enrollment.setCourse(target); enrollment.setStudent(student); enrollments.save(enrollment); added++;
+        }
+        return new EnrollmentImportResult(added, existing);
+    }
+    private List<List<String>> parseCsv(String text) {
+        List<List<String>> rows = new ArrayList<>(); List<String> row = new ArrayList<>(); StringBuilder cell = new StringBuilder();
+        boolean quoted = false;
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (quoted) {
+                if (ch == '"' && i + 1 < text.length() && text.charAt(i + 1) == '"') { cell.append('"'); i++; }
+                else if (ch == '"') quoted = false;
+                else cell.append(ch);
+            } else if (ch == '"' && cell.length() == 0) quoted = true;
+            else if (ch == ',') { row.add(cell.toString()); cell.setLength(0); }
+            else if (ch == '\r' || ch == '\n') {
+                if (ch == '\r' && i + 1 < text.length() && text.charAt(i + 1) == '\n') i++;
+                row.add(cell.toString()); cell.setLength(0);
+                if (!(row.size() == 1 && row.get(0).isEmpty())) rows.add(row);
+                row = new ArrayList<>();
+            } else cell.append(ch);
+        }
+        if (quoted) throw new RuleException("CSV 따옴표 형식을 확인해주세요.");
+        if (cell.length() > 0 || !row.isEmpty()) { row.add(cell.toString()); rows.add(row); }
+        return rows;
     }
     @Transactional public Assignment saveAssignment(Long courseId, Long taskId, Forms.AssignmentForm form, MultipartFile attachment, Account a) {
         role(a, Account.Role.INSTRUCTOR); Course c = course(courseId, a);

@@ -36,6 +36,17 @@ public class WebController {
         if (result.hasErrors()) { m.addAttribute("courses", service.myCourses(user(p))); return "instructor/courses"; }
         Course c = service.createCourse(form, user(p)); return done(flash, "강좌가 개설되었습니다. 참여코드를 학생에게 안내해주세요.", "/instructor/courses/" + c.getId());
     }
+    @PostMapping("/instructor/courses/{id}/refresh-code") public String refreshCourseCode(@PathVariable Long id, Principal p, RedirectAttributes flash) {
+        service.refreshCourseCode(id, user(p));
+        return done(flash, "새 참여코드가 발급되었습니다. 이전 코드는 더 이상 사용할 수 없습니다.", "/instructor/courses/" + id);
+    }
+    @PostMapping("/instructor/courses/{id}/enrollments/import") public String importEnrollments(@PathVariable Long id,
+        @RequestParam("file") MultipartFile file, Principal p, RedirectAttributes flash) {
+        PlanifyService.EnrollmentImportResult result = service.importEnrollmentCsv(id, file, user(p));
+        String message = "수강 등록 " + result.enrolled() + "명";
+        if (result.alreadyEnrolled() > 0) message += ", 기존 등록 " + result.alreadyEnrolled() + "명 건너뜀";
+        return done(flash, message + " 처리되었습니다.", "/instructor/courses/" + id);
+    }
     @GetMapping("/instructor/courses/{id}") public String course(@PathVariable Long id, @RequestParam(defaultValue = "") String q, @RequestParam(defaultValue = "") String status, Principal p, Model m) {
         Course c = service.course(id, user(p)); m.addAttribute("course", c);
         m.addAttribute("students", service.students(id, user(p)));

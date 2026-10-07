@@ -6,6 +6,7 @@ import org.springframework.data.jpa.repository.*;
 
 interface AccountRepository extends JpaRepository<Account, Long> {
     Optional<Account> findByEmail(String email);
+    Optional<Account> findByStudentNumber(String number);
     boolean existsByStudentNumber(String number);
 }
 interface CourseRepository extends JpaRepository<Course, Long> {

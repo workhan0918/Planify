@@ -278,6 +278,26 @@ class PlanifyIntegrationTests {
         mvc.perform(get("/instructor/courses/"+course.getId()+"/grades.csv").with(user(instructor.getEmail()).roles("INSTRUCTOR"))).andExpect(status().isOk()).andExpect(content().bytes(bytes));
         mvc.perform(get("/instructor/courses/"+course.getId()+"/grades.csv").with(user(student.getEmail()).roles("STUDENT"))).andExpect(status().isForbidden());
     }
+    @Test void instructorCanRotateCourseCodeAndImportRosterByStudentNumber() {
+        String oldCode = course.getCode();
+        String newCode = service.refreshCourseCode(course.getId(), instructor);
+        assertThat(newCode).isNotEqualTo(oldCode);
+        assertThat(service.course(course.getId(), student).getId()).isEqualTo(course.getId());
+        assertThatThrownBy(() -> service.enroll(oldCode, stranger)).isInstanceOf(RuleException.class);
+
+        String csv = "\uFEFF\"이름\",\"학번\",\"이메일\"\r\n\"학생\",\"20260001\",\"student@test.local\"\r\n"
+            + "\"학생\",\"20260002\",\"stranger@test.local\"\r\n\"중복\",\"20260002\",\"stranger@test.local\"\r\n";
+        var upload = new MockMultipartFile("file", "roster.csv", "text/csv", csv.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        var result = service.importEnrollmentCsv(course.getId(), upload, instructor);
+        assertThat(result.enrolled()).isEqualTo(1); assertThat(result.alreadyEnrolled()).isEqualTo(1);
+        assertThat(enrollments.existsByCourseIdAndStudentId(course.getId(), stranger.getId())).isTrue();
+
+        String unknownCsv = "학번\n20260002\n99999999\n";
+        var invalid = new MockMultipartFile("file", "unknown.csv", "text/csv", unknownCsv.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertThatThrownBy(() -> service.importEnrollmentCsv(course.getId(), invalid, instructor))
+            .isInstanceOf(RuleException.class).hasMessageContaining("등록되지 않은 학생 학번");
+        assertThat(enrollments.findByCourseIdOrderByStudentStudentNumberAsc(course.getId())).hasSize(2);
+    }
     @Test void developmentValidationDoesNotOverwritePriorVersion() throws Exception {
         service.submit(task.getId(),file("first.zip"),student); String oldKey = currentSubmission().getFileKey();
         mvc.perform(multipart("/student/assignments/"+task.getId()+"/submit").file(file("next.zip")).param("prompts","x".repeat(10001))
