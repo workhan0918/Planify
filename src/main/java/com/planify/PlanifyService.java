@@ -18,10 +18,15 @@ public class PlanifyService {
     private final PasswordEncoder encoder;
     private final FileStorage files;
     private final Clock clock;
+    private final RevisionRepository revisions;
+    private final UnlockAuditRepository unlocks;
+    private final NotificationRepository notifications;
     public PlanifyService(AccountRepository accounts, CourseRepository courses, EnrollmentRepository enrollments,
-        AssignmentRepository assignments, SubmissionRepository submissions, PasswordEncoder encoder, FileStorage files, Clock clock) {
+        AssignmentRepository assignments, SubmissionRepository submissions, PasswordEncoder encoder, FileStorage files, Clock clock,
+        RevisionRepository revisions, UnlockAuditRepository unlocks, NotificationRepository notifications) {
         this.accounts = accounts; this.courses = courses; this.enrollments = enrollments;
         this.assignments = assignments; this.submissions = submissions; this.encoder = encoder; this.files = files; this.clock = clock;
+        this.revisions = revisions; this.unlocks = unlocks; this.notifications = notifications;
     }
     public LocalDateTime now() { return LocalDateTime.now(clock); }
     public List<Enrollment> students(Long courseId, Account a) { role(a, Account.Role.INSTRUCTOR); course(courseId, a); return enrollments.findByCourseIdOrderByStudentStudentNumberAsc(courseId); }
@@ -70,42 +75,76 @@ public class PlanifyService {
         if (!form.getStartsAt().isBefore(form.getEndsAt())) throw new RuleException("종료일시는 시작일시보다 늦어야 합니다.");
         Assignment task = taskId == null ? new Assignment() : assignments.lockById(taskId).orElseThrow(() -> new RuleException("과제가 없습니다."));
         if (taskId != null && !task.getCourse().getId().equals(courseId)) throw new AccessDeniedException("과제의 강좌가 다릅니다.");
-        if (taskId != null && submissions.findByAssignmentId(taskId).stream().anyMatch(s -> s.getScore() != null && s.getScore() > form.getMaxScore()))
+        List<RubricCriterion> rubric = parseRubric(form.getRubricText());
+        int maxScore = rubric.isEmpty() ? form.getMaxScore() : rubric.stream().mapToInt(RubricCriterion::getPoints).sum();
+        if (maxScore < 0 || maxScore > 100000) throw new RuleException("배점 합계는 0~100,000점이어야 합니다.");
+        if (taskId != null && submissions.findByAssignmentId(taskId).stream().anyMatch(s -> s.getScore() != null && s.getScore() > maxScore))
             throw new RuleException("이미 채점된 점수보다 배점을 낮출 수 없습니다.");
+        if (taskId != null && !rubricText(task).equals(formatRubric(rubric)) && submissions.findByAssignmentId(taskId).stream().anyMatch(s -> s.getScore() != null))
+            throw new RuleException("채점된 제출물이 있는 과제는 평가 항목을 변경할 수 없습니다.");
         task.setCourse(c); task.setTitle(form.getTitle().trim()); task.setDescription(form.getDescription());
-        task.setStartsAt(form.getStartsAt()); task.setEndsAt(form.getEndsAt()); task.setMaxScore(form.getMaxScore());
-        if (attachment != null && !attachment.isEmpty()) {
+        task.setStartsAt(form.getStartsAt()); task.setEndsAt(form.getEndsAt()); task.setMaxScore(maxScore);
+        task.getRubric().clear(); task.getRubric().addAll(rubric);
+        if (attachment != null && attachment.getOriginalFilename() != null && !attachment.getOriginalFilename().isBlank()) {
             var stored = files.replace(attachment, task.getAttachmentKey()); task.setAttachmentKey(stored.key()); task.setAttachmentName(stored.name());
         }
-        return assignments.save(task);
+        Assignment saved = assignments.save(task);
+        if (taskId == null) enrollments.findByCourseIdOrderByStudentStudentNumberAsc(courseId)
+            .forEach(e -> notify(e.getStudent(), saved, "새 과제: " + saved.getTitle()));
+        return saved;
     }
     @Transactional public void deleteAssignment(Long id, Account a) {
         role(a, Account.Role.INSTRUCTOR);
         Assignment task = assignments.lockById(id).orElseThrow(() -> new RuleException("과제가 없습니다.")); course(task.getCourse().getId(), a);
-        submissions.findByAssignmentId(id).forEach(s -> files.removeAfterCommit(s.getFileKey()));
+        submissions.findByAssignmentId(id).forEach(s -> {
+            revisions.findBySubmissionIdOrderByRevisionNumberDesc(s.getId()).forEach(r -> files.removeAfterCommit(r.getFileKey()));
+            revisions.deleteBySubmissionId(s.getId()); unlocks.deleteBySubmissionId(s.getId()); files.removeAfterCommit(s.getFileKey());
+        });
+        revisions.flush(); unlocks.flush();
         submissions.deleteByAssignmentId(id); submissions.flush(); files.removeAfterCommit(task.getAttachmentKey()); assignments.delete(task);
     }
     @Transactional public void submit(Long id, MultipartFile file, Account a) {
+        submit(id, file, new Forms.DevelopmentForm(), a);
+    }
+    @Transactional public void submit(Long id, MultipartFile file, Forms.DevelopmentForm development, Account a) {
         role(a, Account.Role.STUDENT);
         // A shared assignment lock serializes upload, grading, edit, and deletion.
         Assignment task = assignments.lockById(id).orElseThrow(() -> new RuleException("과제가 없습니다.")); course(task.getCourse().getId(), a);
         if (!task.isOpen(now())) throw new RuleException("과제 제출 기간이 아닙니다.");
         Submission s = submissions.findByAssignmentIdAndStudentId(id, a.getId()).orElseGet(Submission::new);
-        if (s.getScore() != null) throw new RuleException("채점 완료된 과제는 재제출할 수 없습니다.");
-        var stored = files.replace(file, s.getFileKey());
+        if (s.getScore() != null && !s.isUnlocked()) throw new RuleException("채점 완료된 과제는 재제출할 수 없습니다.");
+        validateDevelopment(development);
+        var stored = files.replace(file, null);
         LocalDateTime submittedAt = now();
         if (!task.isOpen(submittedAt)) throw new RuleException("파일 저장 중 제출 기간이 종료되었습니다.");
-        s.setAssignment(task); s.setStudent(a); s.setFileKey(stored.key()); s.setFileName(stored.name()); s.setSubmittedAt(submittedAt); submissions.save(s);
+        if (s.getId() != null) archive(s);
+        s.setAssignment(task); s.setStudent(a); s.setFileKey(stored.key()); s.setFileName(stored.name()); s.setSubmittedAt(submittedAt);
+        s.setDevelopment(development.record()); s.setScore(null); s.setFeedback(null); s.setGradedAt(null); s.getRubricScores().clear(); s.setResubmissionAllowed(false);
+        submissions.save(s);
     }
     @Transactional public void grade(Long id, int score, String feedback, Account a) {
+        grade(id, score, null, feedback, a);
+    }
+    @Transactional public void grade(Long id, Integer score, List<Integer> itemScores, String feedback, Account a) {
         role(a, Account.Role.INSTRUCTOR);
         Long taskId = submissions.assignmentId(id).orElseThrow(() -> new RuleException("제출물이 없습니다."));
         Assignment task = assignments.lockById(taskId).orElseThrow(() -> new RuleException("과제가 없습니다."));
         course(task.getCourse().getId(), a);
         Submission s = submissions.findById(id).orElseThrow(() -> new RuleException("제출물이 없습니다."));
-        if (score < 0 || score > task.getMaxScore()) throw new RuleException("점수는 0~" + task.getMaxScore() + " 범위로 입력해주세요.");
+        if (!task.getRubric().isEmpty()) {
+            if (itemScores == null || itemScores.size() != task.getRubric().size()) throw new RuleException("모든 평가 항목의 점수를 입력해주세요.");
+            for (int i = 0; i < itemScores.size(); i++) {
+                Integer points = itemScores.get(i);
+                if (points == null || points < 0 || points > task.getRubric().get(i).getPoints()) throw new RuleException("평가 항목별 배점 범위를 확인해주세요.");
+            }
+            score = itemScores.stream().mapToInt(Integer::intValue).sum();
+        }
+        if (score == null || score < 0 || score > task.getMaxScore()) throw new RuleException("점수는 0~" + task.getMaxScore() + " 범위로 입력해주세요.");
         if (feedback == null || feedback.length() > 5000) throw new RuleException("피드백은 최대 5000자입니다.");
-        s.setScore(score); s.setFeedback(feedback); s.setGradedAt(now());
+        s.getRubricScores().clear();
+        if (!task.getRubric().isEmpty()) for (int i = 0; i < itemScores.size(); i++) s.getRubricScores().put(i, itemScores.get(i));
+        s.setScore(score); s.setFeedback(feedback); s.setGradedAt(now()); s.setResubmissionAllowed(false);
+        notify(s.getStudent(), task, "채점 완료: " + task.getTitle());
     }
     public Submission submission(Long id, Account a) {
         Submission s = submissions.findById(id).orElseThrow(() -> new RuleException("제출물이 없습니다."));
@@ -125,7 +164,10 @@ public class PlanifyService {
         return enrollments.findByCourseIdOrderByStudentStudentNumberAsc(task.getCourse().getId()).stream()
             .map(e -> new StudentRow(e.getStudent(), submitted.get(e.getStudent().getId()))).toList();
     }
-    public record Stats(long expected, long submitted, long graded, Double average, double rate, long urgent) {}
+    public record Stats(long expected, long submitted, long graded, Double average, double rate, long urgent) {
+        public long pending() { return submitted - graded; }
+        public double gradingRate() { return submitted == 0 ? 0 : graded * 100.0 / submitted; }
+    }
     public record CourseStats(Course course, Stats stats) {}
     public Stats studentStats(List<TaskRow> rows) {
         var graded = rows.stream().filter(r -> r.submission() != null && r.submission().getScore() != null && r.task().getMaxScore() > 0).toList();
@@ -148,5 +190,127 @@ public class PlanifyService {
         long submitted = rows.stream().filter(r -> r.submission() != null).count();
         Double avg = graded.isEmpty() ? null : graded.stream().mapToInt(r -> r.submission().getScore()).average().orElse(0);
         return new Stats(rows.size(), submitted, graded.size(), avg, rows.isEmpty() ? 0 : submitted * 100.0 / rows.size(), 0);
+    }
+    public String rubricText(Assignment task) { return formatRubric(task.getRubric()); }
+    private String formatRubric(List<RubricCriterion> rubric) {
+        return rubric.stream().map(r -> r.getName() + " | " + r.getPoints()).collect(java.util.stream.Collectors.joining("\n"));
+    }
+    private List<RubricCriterion> parseRubric(String text) {
+        if (text == null || text.isBlank()) return new ArrayList<>();
+        if (text.length() > 4000) throw new RuleException("평가 항목은 최대 4,000자입니다.");
+        List<RubricCriterion> result = new ArrayList<>(); Set<String> names = new HashSet<>();
+        for (String line : text.split("\\R")) {
+            if (line.isBlank()) continue;
+            int separator = line.lastIndexOf('|');
+            if (separator < 1) throw new RuleException("평가 항목은 '항목명 | 배점' 형식으로 한 줄씩 입력해주세요.");
+            String name = line.substring(0, separator).trim(); int points;
+            try { points = Integer.parseInt(line.substring(separator + 1).trim()); }
+            catch (NumberFormatException ex) { throw new RuleException("평가 항목 배점은 정수여야 합니다."); }
+            if (name.isBlank() || name.length() > 100 || name.contains("|") || !names.add(name) || points < 0 || points > 100000)
+                throw new RuleException("항목명은 서로 다른 1~100자, 배점은 0~100,000점으로 설정해주세요.");
+            RubricCriterion criterion = new RubricCriterion(); criterion.setName(name); criterion.setPoints(points); result.add(criterion);
+        }
+        if (result.size() > 20) throw new RuleException("평가 항목은 최대 20개입니다.");
+        return result;
+    }
+    private void validateDevelopment(Forms.DevelopmentForm d) {
+        if (d == null || tooLong(d.getAiTools(), 500) || tooLong(d.getPrompts(), 10000) || tooLong(d.getModifications(), 10000) || tooLong(d.getVerification(), 10000))
+            throw new RuleException("개발 기록은 AI 도구 500자, 나머지 항목은 각각 10,000자 이내로 입력해주세요.");
+    }
+    private boolean tooLong(String value, int max) { return value != null && value.length() > max; }
+    private void archive(Submission s) {
+        SubmissionRevision r = new SubmissionRevision(); r.setSubmission(s); r.setRevisionNumber((int) revisions.countBySubmissionId(s.getId()) + 1);
+        r.setFileKey(s.getFileKey()); r.setFileName(s.getFileName()); r.setSubmittedAt(s.getSubmittedAt());
+        r.setScore(s.getScore()); r.setFeedback(s.getFeedback()); r.setGradedAt(s.getGradedAt()); r.setMaxScore(s.getAssignment().getMaxScore());
+        r.setDevelopment(s.getDevelopment() == null ? null : s.getDevelopment().copy());
+        List<String> details = new ArrayList<>();
+        for (int i = 0; i < s.getAssignment().getRubric().size(); i++) {
+            RubricCriterion criterion = s.getAssignment().getRubric().get(i);
+            details.add(criterion.getName() + ": " + (s.getRubricScores().containsKey(i) ? s.getRubricScores().get(i) : "미채점") + " / " + criterion.getPoints());
+        }
+        r.setRubricSummary(String.join("\n", details)); revisions.save(r);
+    }
+    public List<SubmissionRevision> history(Long submissionId, Account a) { submission(submissionId, a); return revisions.findBySubmissionIdOrderByRevisionNumberDesc(submissionId); }
+    public List<UnlockAudit> unlockHistory(Long submissionId, Account a) { submission(submissionId, a); return unlocks.findBySubmissionIdOrderByUnlockedAtDesc(submissionId); }
+    public SubmissionRevision revision(Long revisionId, Account a) {
+        SubmissionRevision r = revisions.findById(revisionId).orElseThrow(() -> new RuleException("제출 이력이 없습니다.")); submission(r.getSubmission().getId(), a); return r;
+    }
+    @Transactional public void unlock(Long submissionId, String reason, Account a) {
+        role(a, Account.Role.INSTRUCTOR);
+        Long taskId = submissions.assignmentId(submissionId).orElseThrow(() -> new RuleException("제출물이 없습니다."));
+        Assignment task = assignments.lockById(taskId).orElseThrow(() -> new RuleException("과제가 없습니다.")); course(task.getCourse().getId(), a);
+        Submission s = submissions.findById(submissionId).orElseThrow();
+        if (!task.isOpen(now())) throw new RuleException("제출 기간 안에서만 잠금을 해제할 수 있습니다.");
+        if (s.getScore() == null || s.isUnlocked()) throw new RuleException("채점 완료되어 잠긴 제출물만 해제할 수 있습니다.");
+        if (reason == null || reason.isBlank() || reason.length() > 500) throw new RuleException("해제 사유를 1~500자로 입력해주세요.");
+        s.setResubmissionAllowed(true); UnlockAudit audit = new UnlockAudit(); audit.setSubmission(s); audit.setInstructor(a); audit.setReason(reason.trim()); audit.setUnlockedAt(now()); unlocks.save(audit);
+        notify(s.getStudent(), task, "재제출 허용: " + task.getTitle());
+    }
+    @Transactional public Assignment duplicate(Long id, Account a) {
+        role(a, Account.Role.INSTRUCTOR); Assignment original = assignments.lockById(id).orElseThrow(() -> new RuleException("과제가 없습니다."));
+        course(original.getCourse().getId(), a);
+        Assignment copy = new Assignment(); copy.setCourse(original.getCourse());
+        String title = original.getTitle(); copy.setTitle(title.substring(0, Math.min(title.length(), 145)) + " (복사)");
+        copy.setDescription(original.getDescription()); copy.setMaxScore(original.getMaxScore());
+        copy.setStartsAt(now().toLocalDate().atStartOfDay()); copy.setEndsAt(now().toLocalDate().atTime(23,59));
+        original.getRubric().forEach(r -> copy.getRubric().add(r.copy()));
+        if (original.getAttachmentKey() != null) { var f = files.copy(original.getAttachmentKey(), original.getAttachmentName()); copy.setAttachmentKey(f.key()); copy.setAttachmentName(f.name()); }
+        assignments.save(copy);
+        enrollments.findByCourseIdOrderByStudentStudentNumberAsc(copy.getCourse().getId()).forEach(e -> notify(e.getStudent(), copy, "새 과제: " + copy.getTitle())); return copy;
+    }
+    private void notify(Account recipient, Assignment task, String message) {
+        Notification n = new Notification(); n.setRecipient(recipient); n.setAssignmentId(task.getId()); n.setMessage(message); n.setCreatedAt(now()); notifications.save(n);
+    }
+    public long unread(Account a) { return notifications.countByRecipientIdAndReadAtIsNull(a.getId()); }
+    public List<Notification> notifications(Account a) { return notifications.findByRecipientIdOrderByCreatedAtDescIdDesc(a.getId()); }
+    @Transactional public String openNotification(Long id, Account a) {
+        Notification n = notifications.findById(id).orElseThrow(() -> new RuleException("알림이 없습니다."));
+        if (!n.getRecipient().getId().equals(a.getId())) throw new AccessDeniedException("본인의 알림만 확인할 수 있습니다.");
+        n.setReadAt(now());
+        if (n.getAssignmentId() == null || assignments.findById(n.getAssignmentId()).isEmpty()) return "/notifications";
+        assignment(n.getAssignmentId(), a); return (a.getRole() == Account.Role.STUDENT ? "/student/assignments/" : "/instructor/assignments/") + n.getAssignmentId();
+    }
+    @Transactional public void readAll(Account a) { notifications(a).stream().filter(n -> n.getReadAt() == null).forEach(n -> n.setReadAt(now())); }
+    private boolean matches(String value, String q) { return value != null && value.toLowerCase(Locale.ROOT).contains(q.toLowerCase(Locale.ROOT)); }
+    private String submissionStatus(Submission s) { return s == null ? "미제출" : s.getScore() == null ? "채점대기" : "채점완료"; }
+    public List<TaskRow> searchStudentTasks(Account a, String q, Long courseId, String status, String submitted) {
+        validateFilters(status, submitted);
+        return studentTasks(a).stream().filter(r -> courseId == null || r.task().getCourse().getId().equals(courseId))
+            .filter(r -> q.isBlank() || matches(r.task().getTitle(), q) || matches(r.task().getCourse().getTitle(), q))
+            .filter(r -> status.isBlank() || r.status().equals(status))
+            .filter(r -> submitted.isBlank() || submissionStatus(r.submission()).equals(submitted)).toList();
+    }
+    public List<Assignment> searchInstructorTasks(Long courseId, Account a, String q, String status) {
+        validateFilters(status, "");
+        return tasks(courseId, a).stream().filter(t -> q.isBlank() || matches(t.getTitle(), q)).filter(t -> status.isBlank() || t.statusAt(now()).equals(status)).toList();
+    }
+    public List<StudentRow> searchRoster(Assignment task, String q, String status) {
+        validateFilters("", status);
+        return roster(task).stream().filter(r -> q.isBlank() || matches(r.student().getName(), q) || matches(r.student().getStudentNumber(), q))
+            .filter(r -> status.isBlank() || submissionStatus(r.submission()).equals(status)).toList();
+    }
+    private void validateFilters(String status, String submission) {
+        if (!Set.of("", "예정", "진행중", "마감").contains(status) || !Set.of("", "미제출", "채점대기", "채점완료").contains(submission)) throw new RuleException("검색 조건을 확인해주세요.");
+    }
+    public byte[] exportCsv(Long courseId, Account a) {
+        role(a, Account.Role.INSTRUCTOR); course(courseId, a);
+        List<Assignment> tasks = assignments.findByCourseIdOrderByEndsAtAsc(courseId);
+        List<String> headers = new ArrayList<>(List.of("학번", "이름", "이메일"));
+        for (Assignment task : tasks) { String prefix = task.getTitle() + " (#" + task.getId() + ") "; headers.addAll(List.of(prefix + "점수", prefix + "배점", prefix + "피드백", prefix + "상태")); }
+        StringBuilder csv = new StringBuilder("\uFEFF").append(csvRow(headers));
+        Map<Long, Map<Long, Submission>> byTask = new HashMap<>();
+        for (Assignment task : tasks) { Map<Long, Submission> map = new HashMap<>(); submissions.findByAssignmentId(task.getId()).forEach(s -> map.put(s.getStudent().getId(), s)); byTask.put(task.getId(), map); }
+        for (Enrollment enrollment : enrollments.findByCourseIdOrderByStudentStudentNumberAsc(courseId)) {
+            Account student = enrollment.getStudent(); List<String> row = new ArrayList<>(List.of(student.getStudentNumber(), student.getName(), student.getEmail()));
+            for (Assignment task : tasks) { Submission s = byTask.get(task.getId()).get(student.getId()); row.add(s == null || s.getScore() == null ? "" : s.getScore().toString()); row.add(Integer.toString(task.getMaxScore())); row.add(s == null || s.getFeedback() == null ? "" : s.getFeedback()); row.add(submissionStatus(s)); }
+            csv.append(csvRow(row));
+        }
+        return csv.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+    private String csvRow(List<String> cells) {
+        return cells.stream().map(cell -> { String value = cell == null ? "" : cell; String first = value.stripLeading();
+            if (!first.isEmpty() && "=+-@".indexOf(first.charAt(0)) >= 0) value = "'" + value;
+            return "\"" + value.replace("\"", "\"\"") + "\"";
+        }).collect(java.util.stream.Collectors.joining(",")) + "\r\n";
     }
 }

@@ -1,0 +1,5 @@
+<!DOCTYPE html><html lang="ko" xmlns:th="http://www.thymeleaf.org" th:replace="~{layout :: page('알림', ~{::section})}"><section>
+<div class="d-flex justify-content-between align-items-center mb-4"><h1 class="h3 mb-0">내 알림</h1><form th:action="@{/notifications/read-all}" method="post"><button class="btn btn-outline-primary btn-sm">모두 읽음</button></form></div>
+<p class="page-intro">새 과제 · 채점 완료 · 재제출 허용 알림을 확인하세요.</p><div class="card shadow"><div class="card-body">
+<p class="empty" th:if="${#lists.isEmpty(notifications)}">알림이 없습니다.</p><div class="border-bottom py-3" th:each="n : ${notifications}"><form th:action="@{/notifications/{id}/read(id=${n.id})}" method="post"><span th:if="${n.readAt == null}" class="badge badge-primary mr-2">새 알림</span><button class="btn btn-link p-0 text-left" th:text="${n.message}"></button><div class="small text-muted mt-2" th:text="${#temporals.format(n.createdAt,'yyyy-MM-dd HH:mm')}"></div></form></div></div></div>
+</section></html>

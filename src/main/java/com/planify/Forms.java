@@ -23,5 +23,16 @@ public class Forms {
         @NotNull @DateTimeFormat(pattern = "yyyy-MM-dd'T'HH:mm") private LocalDateTime startsAt;
         @NotNull @DateTimeFormat(pattern = "yyyy-MM-dd'T'HH:mm") private LocalDateTime endsAt;
         @Min(0) @Max(100000) private int maxScore;
+        @Size(max = 4000) private String rubricText;
+    }
+    @Getter @Setter public static class DevelopmentForm {
+        @Size(max = 500) private String aiTools;
+        @Size(max = 10000) private String prompts;
+        @Size(max = 10000) private String modifications;
+        @Size(max = 10000) private String verification;
+        public DevelopmentRecord record() {
+            DevelopmentRecord d = new DevelopmentRecord(); d.setAiTools(aiTools); d.setPrompts(prompts);
+            d.setModifications(modifications); d.setVerification(verification); return d;
+        }
     }
 }

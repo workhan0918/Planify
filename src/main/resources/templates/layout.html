@@ -20,6 +20,7 @@
       <li class="nav-item"><a class="nav-link" th:href="@{/student/courses}">수강 등록 · 내 강좌</a></li>
       <li class="nav-item"><a class="nav-link" th:href="@{/student/assignments}">내 과제 · 결과 확인</a></li>
     </th:block>
+    <li class="nav-item"><a class="nav-link" th:href="@{/notifications}">알림 <span class="badge badge-light ml-1" th:text="${unreadCount}"></span></a></li>
     <hr class="sidebar-divider"><li class="px-3 text-white-50 small">오늘의 계획을<br>완성으로 연결하세요.</li>
   </ul>
   <div id="content-wrapper" class="d-flex flex-column"><div id="content">

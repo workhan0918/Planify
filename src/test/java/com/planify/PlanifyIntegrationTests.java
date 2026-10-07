@@ -25,10 +25,14 @@ class PlanifyIntegrationTests {
     @Autowired EnrollmentRepository enrollments;
     @Autowired AssignmentRepository assignments;
     @Autowired SubmissionRepository submissions;
+    @Autowired RevisionRepository revisions;
+    @Autowired UnlockAuditRepository unlocks;
+    @Autowired NotificationRepository notifications;
     Account instructor, student, stranger;
     Course course;
     Assignment task;
     @BeforeEach void setup() {
+        notifications.deleteAll(); unlocks.deleteAll(); revisions.deleteAll();
         submissions.deleteAll(); assignments.deleteAll(); enrollments.deleteAll(); courses.deleteAll();
         accounts.findAll().stream().filter(a -> a.getRole() == Account.Role.STUDENT).forEach(accounts::delete);
         instructor = service.account("instructor@planify.local");
@@ -50,7 +54,8 @@ class PlanifyIntegrationTests {
         Submission first = submissions.findByAssignmentIdAndStudentId(task.getId(), student.getId()).orElseThrow(); String old = first.getFileKey();
         service.submit(task.getId(), file("second.zip"), student);
         Submission second = submissions.findById(first.getId()).orElseThrow();
-        assertThat(second.getFileName()).isEqualTo("second.zip"); assertThatThrownBy(() -> files.load(old)).isInstanceOf(RuleException.class);
+        assertThat(second.getFileName()).isEqualTo("second.zip"); assertThat(files.load(old).exists()).isTrue();
+        assertThat(service.history(second.getId(), student)).hasSize(1);
         service.grade(second.getId(), 80, "좋습니다.", instructor);
         assertThatThrownBy(() -> service.submit(task.getId(), file("third.zip"), student)).isInstanceOf(RuleException.class).hasMessageContaining("채점 완료");
         assertThat(service.studentStats(service.studentTasks(student)).average()).isEqualTo(80.0);
@@ -160,7 +165,8 @@ class PlanifyIntegrationTests {
             .file(new MockMultipartFile("file", name, "text/plain", revisedBytes)).with(learner).with(csrf())).andExpect(status().is3xxRedirection());
         mvc.perform(get("/files/assignments/" + task.getId()).with(learner)).andExpect(content().bytes(teacherBytes));
         mvc.perform(get("/files/submissions/" + first.getId()).with(learner)).andExpect(content().bytes(revisedBytes));
-        assertThatThrownBy(() -> files.load(first.getFileKey())).isInstanceOf(RuleException.class);
+        assertThat(files.load(first.getFileKey()).exists()).isTrue();
+        assertThat(service.history(first.getId(), student)).hasSize(1);
     }
     @Test void emptySelectedFileHasSpecificMessageAndPreservesExistingSubmission() throws Exception {
         service.submit(task.getId(), file("sql.txt"), student);
@@ -170,6 +176,144 @@ class PlanifyIntegrationTests {
             .with(user(student.getEmail()).roles("STUDENT")).with(csrf()))
             .andExpect(status().isBadRequest()).andExpect(content().string(org.hamcrest.Matchers.containsString("선택한 파일이 0바이트입니다.")));
         assertThat(submissions.findById(previous.getId()).orElseThrow().getFileKey()).isEqualTo(previous.getFileKey());
-        assertThat(files.load(previous.getFileKey()).getInputStream().readAllBytes()).containsExactly(1,2,3);
+        try (var input = files.load(previous.getFileKey()).getInputStream()) { assertThat(input.readAllBytes()).containsExactly(1,2,3); }
+    }
+    Forms.AssignmentForm rubricForm(String text) {
+        var f = new Forms.AssignmentForm(); f.setTitle("평가 항목 과제"); f.setDescription("항목별 채점");
+        f.setStartsAt(service.now().minusHours(1)); f.setEndsAt(service.now().plusHours(1)); f.setMaxScore(5); f.setRubricText(text); return f;
+    }
+    Submission currentSubmission() { return submissions.findByAssignmentIdAndStudentId(task.getId(), student.getId()).orElseThrow(); }
+    @Test void rubricScoresAreValidatedAndSummedByServer() throws Exception {
+        var f = rubricForm("기능 구현 | 60\n화면 구성 | 40");
+        Assignment saved = service.saveAssignment(course.getId(), task.getId(), f, null, instructor);
+        assertThat(saved.getMaxScore()).isEqualTo(100); assertThat(saved.getRubric()).hasSize(2);
+        service.submit(task.getId(), file("project.zip"), student); Long id = currentSubmission().getId();
+        assertThatThrownBy(() -> service.grade(id, 99, java.util.List.of(61, 20), "", instructor)).isInstanceOf(RuleException.class);
+        assertThatThrownBy(() -> service.grade(id, 99, java.util.List.of(30), "", instructor)).isInstanceOf(RuleException.class);
+        assertThat(currentSubmission().getScore()).isNull();
+        mvc.perform(post("/instructor/submissions/"+id+"/grade").param("score","99999").param("itemScores","50","30")
+            .param("feedback","항목별 평가").with(user(instructor.getEmail()).roles("INSTRUCTOR")).with(csrf())).andExpect(status().is3xxRedirection());
+        assertThat(currentSubmission().getScore()).isEqualTo(80); assertThat(currentSubmission().getRubricScores()).containsEntry(0,50).containsEntry(1,30);
+        f.setRubricText("다른 기준 | 100"); assertThatThrownBy(() -> service.saveAssignment(course.getId(), task.getId(), f, null, instructor)).isInstanceOf(RuleException.class);
+        mvc.perform(get("/instructor/assignments/"+task.getId()).with(user(instructor.getEmail()).roles("INSTRUCTOR"))).andExpect(status().isOk()).andExpect(content().string(org.hamcrest.Matchers.containsString("기능 구현")));
+        mvc.perform(get("/student/assignments/"+task.getId()).with(user(student.getEmail()).roles("STUDENT"))).andExpect(status().isOk());
+        mvc.perform(get("/instructor/assignments/"+task.getId()+"/edit").with(user(instructor.getEmail()).roles("INSTRUCTOR"))).andExpect(status().isOk());
+    }
+    @Test void invalidRubricDoesNotModifyAssignment() {
+        for (String invalid : new String[]{"형식 오류", "같은 이름 | 1\n같은 이름 | 2", "항목 | -1", "항목 | nope", "A | 100000\nB | 1"})
+            assertThatThrownBy(() -> service.saveAssignment(course.getId(), task.getId(), rubricForm(invalid), null, instructor)).isInstanceOf(RuleException.class);
+        assertThat(assignments.findById(task.getId()).orElseThrow().getMaxScore()).isEqualTo(100);
+    }
+    @Test void unlockPreservesScoreUntilResubmissionThenArchivesGradeAndDevelopment() throws Exception {
+        var dev = new Forms.DevelopmentForm(); dev.setAiTools("Codex"); dev.setPrompts("첫 프롬프트"); dev.setModifications("직접 수정"); dev.setVerification("테스트 실행");
+        service.submit(task.getId(), file("v1.zip"), dev, student); Long id = currentSubmission().getId(); String oldKey = currentSubmission().getFileKey();
+        service.grade(id, 80, "이전 피드백", instructor);
+        assertThatThrownBy(() -> service.unlock(id, "", instructor)).isInstanceOf(RuleException.class);
+        service.unlock(id, "수정 기회 제공", instructor); assertThat(currentSubmission().getScore()).isEqualTo(80); assertThat(currentSubmission().isUnlocked()).isTrue();
+        assertThatThrownBy(() -> service.unlock(id, "중복", instructor)).isInstanceOf(RuleException.class);
+        dev.setPrompts("수정 프롬프트"); service.submit(task.getId(), file("v2.zip"), dev, student);
+        Submission latest = currentSubmission(); assertThat(latest.getScore()).isNull(); assertThat(latest.getFeedback()).isNull(); assertThat(latest.isUnlocked()).isFalse();
+        SubmissionRevision old = service.history(id, student).get(0); assertThat(old.getScore()).isEqualTo(80); assertThat(old.getFeedback()).isEqualTo("이전 피드백");
+        assertThat(old.getDevelopment().getPrompts()).isEqualTo("첫 프롬프트"); assertThat(files.load(oldKey).exists()).isTrue();
+        assertThat(service.unlockHistory(id, instructor)).hasSize(1); assertThat(service.assignmentStats(service.assignment(task.getId(), instructor)).pending()).isEqualTo(1);
+        mvc.perform(get("/submissions/"+id+"/history").with(user(student.getEmail()).roles("STUDENT"))).andExpect(status().isOk()).andExpect(content().string(org.hamcrest.Matchers.containsString("이전 피드백")));
+        service.enroll(course.getCode(), stranger);
+        mvc.perform(get("/files/revisions/"+old.getId()).with(user(stranger.getEmail()).roles("STUDENT"))).andExpect(status().isForbidden());
+        mvc.perform(get("/submissions/"+id+"/history").with(user(stranger.getEmail()).roles("STUDENT"))).andExpect(status().isForbidden());
+        mvc.perform(post("/instructor/submissions/"+id+"/unlock").param("reason","bad").with(user(student.getEmail()).roles("STUDENT")).with(csrf())).andExpect(status().isForbidden());
+        mvc.perform(get("/files/revisions/"+old.getId()).with(user(instructor.getEmail()).roles("INSTRUCTOR"))).andExpect(status().isOk());
+    }
+    @Test void unlockedSubmissionStillCannotBeSubmittedOutsidePeriod() {
+        service.submit(task.getId(), file("one.zip"), student); service.grade(currentSubmission().getId(), 70, "", instructor);
+        service.unlock(currentSubmission().getId(), "허용", instructor);
+        save(task.getId(), service.now().minusDays(2), service.now().minusDays(1), 100);
+        assertThatThrownBy(() -> service.submit(task.getId(), file("late.zip"), student)).isInstanceOf(RuleException.class).hasMessageContaining("기간");
+        assertThat(currentSubmission().getScore()).isEqualTo(70); assertThat(service.history(currentSubmission().getId(), student)).isEmpty();
+        assertThatThrownBy(() -> service.unlock(currentSubmission().getId(), "허용", instructor)).isInstanceOf(RuleException.class).hasMessageContaining("기간");
+    }
+    @Test void duplicateHasIndependentAttachmentAndNoCopiedSubmissions() throws Exception {
+        var f = rubricForm("기능 | 70\n기록 | 30");
+        Assignment original = service.saveAssignment(course.getId(), task.getId(), f, file("guide.zip"), instructor);
+        service.submit(task.getId(), file("student.zip"), student); service.grade(currentSubmission().getId(), null, java.util.List.of(60,20), "", instructor);
+        mvc.perform(post("/instructor/assignments/"+task.getId()+"/duplicate").with(user(instructor.getEmail()).roles("INSTRUCTOR")).with(csrf())).andExpect(status().is3xxRedirection());
+        Assignment copy = assignments.findByCourseIdOrderByEndsAtAsc(course.getId()).stream().filter(t -> !t.getId().equals(task.getId())).findFirst().orElseThrow();
+        assertThat(copy.getTitle()).endsWith("(복사)"); assertThat(copy.getRubric()).hasSize(2); assertThat(copy.getMaxScore()).isEqualTo(100);
+        assertThat(copy.getStartsAt()).isEqualTo(service.now().toLocalDate().atStartOfDay()); assertThat(copy.getEndsAt()).isEqualTo(service.now().toLocalDate().atTime(23,59));
+        assertThat(copy.getAttachmentKey()).isNotEqualTo(original.getAttachmentKey()); assertThat(submissions.findByAssignmentId(copy.getId())).isEmpty();
+        service.deleteAssignment(task.getId(), instructor); assertThat(files.load(copy.getAttachmentKey()).exists()).isTrue();
+    }
+    @Test void notificationsAreOwnedReadableAndSafeAfterAssignmentDeletion() throws Exception {
+        notifications.deleteAll(); save(null, service.now().minusHours(1), service.now().plusHours(1), 100);
+        assertThat(service.unread(student)).isEqualTo(1); assertThat(service.unread(stranger)).isZero();
+        Notification n = service.notifications(student).get(0);
+        mvc.perform(post("/notifications/"+n.getId()+"/read").with(user(stranger.getEmail()).roles("STUDENT")).with(csrf())).andExpect(status().isForbidden());
+        assertThat(service.unread(student)).isEqualTo(1);
+        mvc.perform(get("/notifications").with(user(student.getEmail()).roles("STUDENT"))).andExpect(status().isOk());
+        mvc.perform(post("/notifications/"+n.getId()+"/read").with(user(student.getEmail()).roles("STUDENT")).with(csrf())).andExpect(redirectedUrl("/student/assignments/"+n.getAssignmentId()));
+        assertThat(service.unread(student)).isZero(); service.submit(task.getId(), file("one.zip"), student); service.grade(currentSubmission().getId(), 90, "", instructor);
+        assertThat(service.notifications(student)).anyMatch(notification -> notification.getMessage().startsWith("채점 완료"));
+        mvc.perform(post("/notifications/read-all").with(user(student.getEmail()).roles("STUDENT")).with(csrf())).andExpect(status().is3xxRedirection());
+        assertThat(service.unread(student)).isZero();
+        service.deleteAssignment(n.getAssignmentId(), instructor); assertThat(service.openNotification(n.getId(), student)).isEqualTo("/notifications");
+    }
+    @Test void searchAndGradingProgressUseFullRoster() throws Exception {
+        save(null, service.now().plusDays(1), service.now().plusDays(2), 50);
+        service.enroll(course.getCode(), stranger); service.submit(task.getId(), file("one.zip"), student);
+        assertThat(service.searchStudentTasks(student,"프로젝트", course.getId(),"진행중","채점대기")).hasSize(1);
+        assertThat(service.searchStudentTasks(student,"", course.getId(),"예정","미제출")).hasSize(1);
+        assertThat(service.searchStudentTasks(student,"일치 없음",null,"","")).isEmpty();
+        assertThat(service.searchRoster(service.assignment(task.getId(), instructor),stranger.getStudentNumber(),"미제출")).hasSize(1);
+        assertThat(service.assignmentStats(service.assignment(task.getId(), instructor)).gradingRate()).isZero();
+        service.grade(currentSubmission().getId(),90,"",instructor);
+        assertThat(service.assignmentStats(service.assignment(task.getId(), instructor)).gradingRate()).isEqualTo(100.0);
+        mvc.perform(get("/student/assignments").param("courseId",course.getId().toString()).param("status","진행중").param("submitted","채점완료").with(user(student.getEmail()).roles("STUDENT"))).andExpect(status().isOk());
+        mvc.perform(get("/instructor/assignments/"+task.getId()).param("submitted","미제출").with(user(instructor.getEmail()).roles("INSTRUCTOR"))).andExpect(status().isOk());
+        mvc.perform(get("/student/assignments").param("status","invalid").with(user(student.getEmail()).roles("STUDENT"))).andExpect(status().isBadRequest());
+    }
+    @Test void csvEscapesFeedbackProtectsFormulasAndRestrictsStudents() throws Exception {
+        student.setName("=1+1"); accounts.save(student); service.enroll(course.getCode(), stranger);
+        service.submit(task.getId(),file("one.zip"),student); service.grade(currentSubmission().getId(),75,"줄1,\"따옴표\"\n줄2",instructor);
+        byte[] bytes = service.exportCsv(course.getId(),instructor); String csv = new String(bytes,java.nio.charset.StandardCharsets.UTF_8);
+        assertThat(csv).startsWith("\uFEFF"); assertThat(csv).contains("'=1+1", "줄1,\"\"따옴표\"\"\n줄2", "미제출", "채점완료");
+        mvc.perform(get("/instructor/courses/"+course.getId()+"/grades.csv").with(user(instructor.getEmail()).roles("INSTRUCTOR"))).andExpect(status().isOk()).andExpect(content().bytes(bytes));
+        mvc.perform(get("/instructor/courses/"+course.getId()+"/grades.csv").with(user(student.getEmail()).roles("STUDENT"))).andExpect(status().isForbidden());
+    }
+    @Test void developmentValidationDoesNotOverwritePriorVersion() throws Exception {
+        service.submit(task.getId(),file("first.zip"),student); String oldKey = currentSubmission().getFileKey();
+        mvc.perform(multipart("/student/assignments/"+task.getId()+"/submit").file(file("next.zip")).param("prompts","x".repeat(10001))
+            .with(user(student.getEmail()).roles("STUDENT")).with(csrf())).andExpect(status().isOk()).andExpect(model().attributeHasFieldErrors("developmentForm","prompts"));
+        assertThat(currentSubmission().getFileKey()).isEqualTo(oldKey); assertThat(service.history(currentSubmission().getId(),student)).isEmpty();
+    }
+    @Test void deleteCleansAllArchivedFilesAndUnlockAudits() {
+        service.submit(task.getId(),file("first.zip"),student); String firstKey=currentSubmission().getFileKey();
+        service.submit(task.getId(),file("second.zip"),student); String secondKey=currentSubmission().getFileKey();
+        service.grade(currentSubmission().getId(),80,"",instructor); service.unlock(currentSubmission().getId(),"수정",instructor);
+        Long id=currentSubmission().getId(); service.deleteAssignment(task.getId(),instructor);
+        assertThat(revisions.findBySubmissionIdOrderByRevisionNumberDesc(id)).isEmpty(); assertThat(unlocks.findBySubmissionIdOrderByUnlockedAtDesc(id)).isEmpty();
+        assertThatThrownBy(() -> files.load(firstKey)).isInstanceOf(RuleException.class); assertThatThrownBy(() -> files.load(secondKey)).isInstanceOf(RuleException.class);
+    }
+    @Test void anotherInstructorCannotCopyUnlockExportOrReadHistory() throws Exception {
+        Account other = new Account(); other.setName("다른 강사"); other.setEmail("other-instructor@test.local");
+        other.setPassword("test-only-unused-hash"); other.setRole(Account.Role.INSTRUCTOR); accounts.save(other);
+        service.submit(task.getId(),file("one.zip"),student); service.submit(task.getId(),file("two.zip"),student);
+        Long id=currentSubmission().getId(); service.grade(id,80,"",instructor);
+        var strangerTeacher = user(other.getEmail()).roles("INSTRUCTOR");
+        mvc.perform(post("/instructor/assignments/"+task.getId()+"/duplicate").with(strangerTeacher).with(csrf())).andExpect(status().isForbidden());
+        mvc.perform(post("/instructor/submissions/"+id+"/unlock").param("reason","bad").with(strangerTeacher).with(csrf())).andExpect(status().isForbidden());
+        mvc.perform(get("/instructor/courses/"+course.getId()+"/grades.csv").with(strangerTeacher)).andExpect(status().isForbidden());
+        mvc.perform(get("/submissions/"+id+"/history").with(strangerTeacher)).andExpect(status().isForbidden());
+        assertThat(currentSubmission().isUnlocked()).isFalse(); assertThat(service.myCourses(instructor)).hasSize(1);
+    }
+    @Test void historicalRubricRemainsUnchangedWhenNewVersionCriteriaChange() {
+        var f = rubricForm("기능 | 70\n기록 | 30"); service.saveAssignment(course.getId(),task.getId(),f,null,instructor);
+        service.submit(task.getId(),file("one.zip"),student); Long id=currentSubmission().getId();
+        service.grade(id,null,java.util.List.of(60,20),"이전 채점",instructor); service.unlock(id,"재평가",instructor);
+        service.submit(task.getId(),file("two.zip"),student);
+        f.setRubricText("새 기준 | 50"); service.saveAssignment(course.getId(),task.getId(),f,null,instructor);
+        SubmissionRevision old=service.history(id,student).get(0); assertThat(old.getMaxScore()).isEqualTo(100);
+        assertThat(old.getScore()).isEqualTo(80); assertThat(old.getRubricSummary()).contains("기능: 60 / 70","기록: 20 / 30");
+        assertThat(currentSubmission().getRubricScores()).isEmpty();
+        assertThatThrownBy(() -> service.saveAssignment(course.getId(),task.getId(),f,new MockMultipartFile("attachment","empty.txt","text/plain",new byte[0]),instructor))
+            .isInstanceOf(RuleException.class).hasMessageContaining("0바이트");
     }
 }

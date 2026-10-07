@@ -1,6 +1,8 @@
 package com.planify;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
 import jakarta.persistence.*;
 import lombok.Getter;
 import lombok.Setter;
@@ -17,5 +19,12 @@ public class Submission {
     private Integer score;
     @Column(length = 5000) private String feedback;
     private LocalDateTime gradedAt;
+    @Embedded private DevelopmentRecord development;
+    private Boolean resubmissionAllowed;
+    @ElementCollection(fetch = FetchType.EAGER)
+    @CollectionTable(name = "submission_rubric_scores", joinColumns = @JoinColumn(name = "submission_id"))
+    @MapKeyColumn(name = "criterion_index") @Column(name = "points")
+    private Map<Integer, Integer> rubricScores = new HashMap<>();
+    public boolean isUnlocked() { return Boolean.TRUE.equals(resubmissionAllowed); }
     @Version private Long version;
 }

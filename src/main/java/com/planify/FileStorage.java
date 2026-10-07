@@ -37,6 +37,15 @@ public class FileStorage {
         });
         return new Stored(key, name);
     }
+    public Stored copy(String sourceKey, String name) {
+        String key = UUID.randomUUID().toString();
+        try { Files.copy(path(sourceKey), path(key)); }
+        catch (IOException ex) { delete(key); throw new RuleException("첨부파일 복사에 실패했습니다."); }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override public void afterCompletion(int status) { if (status != STATUS_COMMITTED) delete(key); }
+        });
+        return new Stored(key, name);
+    }
     public void removeAfterCommit(String key) {
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override public void afterCommit() { delete(key); }

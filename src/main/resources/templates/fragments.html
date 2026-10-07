@@ -1,0 +1,9 @@
+<!DOCTYPE html><html lang="ko" xmlns:th="http://www.thymeleaf.org"><body>
+<div th:fragment="development(record)" class="development-record" th:if="${record != null}">
+  <details><summary class="text-primary mb-2">바이브 코딩 개발 과정</summary>
+    <dl><dt>사용한 AI 도구</dt><dd class="description" th:text="${record.aiTools ?: '미작성'}"></dd>
+    <dt>주요 프롬프트</dt><dd class="description" th:text="${record.prompts ?: '미작성'}"></dd>
+    <dt>직접 수정한 내용</dt><dd class="description" th:text="${record.modifications ?: '미작성'}"></dd>
+    <dt>검증 방법</dt><dd class="description" th:text="${record.verification ?: '미작성'}"></dd></dl>
+  </details>
+</div></body></html>

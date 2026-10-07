@@ -1,4 +1,17 @@
 document.addEventListener('DOMContentLoaded', () => {
+document.querySelectorAll('[data-compare-target]').forEach(select => {
+  const show = () => {
+    const source = document.getElementById(select.value);
+    const target = document.getElementById(select.dataset.compareTarget);
+    if (!source || !target) return;
+    const clone = source.cloneNode(true);
+    clone.removeAttribute('id');
+    clone.querySelectorAll('[id]').forEach(element => element.removeAttribute('id'));
+    clone.querySelectorAll('details').forEach(element => element.open = true);
+    target.replaceChildren(clone);
+  };
+  select.addEventListener('change', show); show();
+});
 document.querySelectorAll('[data-confirm]').forEach(form => form.addEventListener('submit', event => {
   if (!window.confirm(form.dataset.confirm)) event.preventDefault();
 }));

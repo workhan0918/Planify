@@ -32,3 +32,16 @@ interface SubmissionRepository extends JpaRepository<Submission, Long> {
     List<Submission> findByStudentId(Long id);
     void deleteByAssignmentId(Long id);
 }
+interface RevisionRepository extends JpaRepository<SubmissionRevision, Long> {
+    List<SubmissionRevision> findBySubmissionIdOrderByRevisionNumberDesc(Long id);
+    long countBySubmissionId(Long id);
+    void deleteBySubmissionId(Long id);
+}
+interface UnlockAuditRepository extends JpaRepository<UnlockAudit, Long> {
+    List<UnlockAudit> findBySubmissionIdOrderByUnlockedAtDesc(Long id);
+    void deleteBySubmissionId(Long id);
+}
+interface NotificationRepository extends JpaRepository<Notification, Long> {
+    List<Notification> findByRecipientIdOrderByCreatedAtDescIdDesc(Long id);
+    long countByRecipientIdAndReadAtIsNull(Long id);
+}
